@@ -28,7 +28,7 @@ def get_connection(df):
 df = load_dataframe()
 con = get_connection(df)
 
-# ================= INTENT HELPERS =================
+# ================= HELPERS =================
 def has_any(q, words):
     return any(w in q for w in words)
 
@@ -43,7 +43,7 @@ def generate_sql(question):
         WHERE sentiment = 'Negative'
         """
 
-    if has_any(q, ["pending"]):
+    if has_any(q, ["unresolved", "pending"]):
         return f"""
         SELECT issue_type, COUNT(*) AS count
         FROM {TABLE_NAME}
@@ -52,7 +52,7 @@ def generate_sql(question):
         ORDER BY count DESC
         """
 
-    if has_any(q, ["sentiment"]):
+    if "sentiment" in q:
         return f"""
         SELECT issue_type, sentiment, COUNT(*) AS count
         FROM {TABLE_NAME}
@@ -86,7 +86,7 @@ def decide_output(df):
     if "sentiment" in df.columns and "issue_type" in df.columns:
         return "stacked_chart"
 
-    if df.shape[0] > 1 and df.shape[1] > 1:
+    if df.shape[0] > 1:
         return "table_chart"
 
     return "summary"
@@ -100,10 +100,10 @@ def generate_insight(question, df):
 
     # KPI insight
     if df.shape == (1, 1):
-        return f"The result shows **{int(df.iloc[0,0])}** matching records."
+        return f"The analysis shows **{int(df.iloc[0,0])}** matching records."
 
-    # Why-type reasoning
-    if has_any(q, ["why", "reason", "cause"]):
+    # WHY reasoning
+    if has_any(q, ["why", "reason", "cause"]) and "sentiment" in df.columns:
         neg = df[df["sentiment"] == "Negative"]
         if not neg.empty:
             top_issue = neg.groupby("issue_type")["count"].sum().idxmax()
@@ -111,16 +111,17 @@ def generate_insight(question, df):
                 neg[neg["resolution_status"] == "Pending"]["count"].sum()
                 / neg["count"].sum()
             ) * 100
+
             return (
-                f"Analysis shows **{top_issue}** as the primary driver. "
-                f"Approximately **{pending_pct:.0f}%** of negative cases remain unresolved, "
-                f"which is increasing customer dissatisfaction."
+                f"Insights indicate **{top_issue}** as the primary driver. "
+                f"About **{pending_pct:.0f}%** of negative cases remain unresolved, "
+                f"which is contributing to customer dissatisfaction."
             )
 
     # Distribution insight
     if "sentiment" in df.columns:
         dominant = df.groupby("sentiment")["count"].sum().idxmax()
-        return f"Overall sentiment is dominated by **{dominant}** cases."
+        return f"The data shows **{dominant}** sentiment as the most dominant."
 
     return "Here is the analysis based on the available data."
 
@@ -131,7 +132,6 @@ question = st.text_input("Ask anything about customers, issues, sentiment, servi
 if st.button("Ask") and question:
     sql = generate_sql(question)
     result = con.execute(sql).fetchdf()
-
     output = decide_output(result)
 
     # KPI
@@ -145,13 +145,21 @@ if st.button("Ask") and question:
         st.bar_chart(result.set_index(result.columns[0]))
         st.success(generate_insight(question, result))
 
-    # STACKED CHART + INSIGHT
+    # STACKED CHART (SAFE)
     elif output == "stacked_chart":
-        pivot = result.pivot(index="issue_type", columns="sentiment", values="count").fillna(0)
-        st.bar_chart(pivot)
+        if "sentiment" in result.columns:
+            pivot = result.pivot(
+                index="issue_type",
+                columns="sentiment",
+                values="count"
+            ).fillna(0)
+            st.bar_chart(pivot)
+        else:
+            st.bar_chart(result.set_index(result.columns[0]))
+
         st.success(generate_insight(question, result))
 
-    # SUMMARY ONLY
+    # SUMMARY
     else:
         st.success(generate_insight(question, result))
 
@@ -159,6 +167,7 @@ if st.button("Ask") and question:
 st.sidebar.header("📌 Example Questions")
 st.sidebar.markdown("""
 - How many customers are frustrated?
+- Count of unresolved issues
 - Which issue type has most pending cases?
 - Show sentiment distribution by issue
 - Why customers are dissatisfied?
