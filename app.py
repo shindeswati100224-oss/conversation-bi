@@ -44,6 +44,9 @@ def detect_intent(q):
     if any(w in q for w in ["most", "top", "highest"]):
         return "TOP"
 
+    if any(w in q for w in ["problems", "facing"]):
+        return "PROBLEMS"
+
     if any(w in q for w in ["overview", "summary", "analyze"]):
         return "SUMMARY"
 
@@ -60,7 +63,14 @@ def generate_sql(intent, q):
             return f"SELECT COUNT(*) AS value FROM {TABLE_NAME} WHERE sentiment='Negative'"
         return f"SELECT COUNT(*) AS value FROM {TABLE_NAME}"
 
-    if intent in ["TOP", "WHY", "SUMMARY", "GENERAL"]:
+    if intent == "DISTRIBUTION":
+        return f"""
+        SELECT issue_type, sentiment, COUNT(*) AS count
+        FROM {TABLE_NAME}
+        GROUP BY issue_type, sentiment
+        """
+
+    if intent in ["TOP", "WHY", "SUMMARY", "PROBLEMS", "GENERAL"]:
         if "pending" in q:
             return f"""
             SELECT issue_type, COUNT(*) AS count
@@ -76,32 +86,25 @@ def generate_sql(intent, q):
         ORDER BY count DESC
         """
 
-    if intent == "DISTRIBUTION":
-        return f"""
-        SELECT issue_type, sentiment, COUNT(*) AS count
-        FROM {TABLE_NAME}
-        GROUP BY issue_type, sentiment
-        """
-
-# ================= WHY + SUMMARY ENGINE (INTENT AWARE) =================
+# ================= SUMMARY / WHY ENGINE =================
 def generate_text(intent, question, df):
     q = question.lower()
 
     if df.empty:
-        return "No data available to explain this."
+        return "No data available."
 
     total = df["count"].sum()
 
-    # -------- WHY LOGIC --------
+    # ---------- WHY (INTENT-AWARE) ----------
     if intent == "WHY":
 
-        def explain(issue_keyword, label):
-            sub = df[df["issue_type"].str.contains(issue_keyword, case=False)]
+        def explain(keyword, label):
+            sub = df[df["issue_type"].str.contains(keyword, case=False)]
             if not sub.empty:
                 cnt = sub.iloc[0]["count"]
                 pct = (cnt / total) * 100
                 return (
-                    f"{label} issues are impacting customers because they account for "
+                    f"{label} issues impact customers because they account for "
                     f"**{pct:.0f}%** of reported cases, indicating resolution and process gaps."
                 )
             return None
@@ -126,21 +129,24 @@ def generate_text(intent, question, df):
                 f"which contribute **{pct:.0f}%** of unresolved cases."
             )
 
-        # generic WHY
         top = df.iloc[0]
         pct = (top["count"] / total) * 100
         return (
-            f"The main driver is **{top['issue_type']}** issues, "
+            f"The primary reason is **{top['issue_type']}** issues, "
             f"accounting for **{pct:.0f}%** of total cases."
         )
 
-    # -------- SUMMARY --------
-    top = df.iloc[0]
-    pct = (top["count"] / total) * 100
-    return (
-        f"Overall, **{top['issue_type']}** is the most common issue type, "
-        f"contributing **{pct:.0f}%** of reported cases."
-    )
+    # ---------- PROBLEMS / MULTI-ISSUE SUMMARY ----------
+    if intent in ["PROBLEMS", "SUMMARY", "GENERAL"]:
+        top_issues = df.head(3)
+        issue_list = ", ".join(top_issues["issue_type"])
+        top = top_issues.iloc[0]
+        pct = (top["count"] / total) * 100
+        return (
+            f"Customers mainly face issues related to **{issue_list}**, "
+            f"with **{top['issue_type']}** being the most frequent, "
+            f"contributing **{pct:.0f}%** of reported cases."
+        )
 
 # ================= UI =================
 st.subheader("💬 Ask a question")
@@ -151,15 +157,15 @@ if st.button("Ask") and question:
     sql = generate_sql(intent, question)
     result = con.execute(sql).fetchdf()
 
-    # ----- COUNT -----
+    # COUNT → KPI
     if intent == "COUNT":
         st.metric("Result", int(result.iloc[0, 0]))
 
-    # ----- WHY -----
-    elif intent == "WHY":
+    # WHY / SUMMARY / PROBLEMS → TEXT ONLY
+    elif intent in ["WHY", "SUMMARY", "PROBLEMS", "GENERAL"]:
         st.success(generate_text(intent, question, result))
 
-    # ----- DISTRIBUTION -----
+    # DISTRIBUTION → CHART ONLY
     elif intent == "DISTRIBUTION":
         pivot = result.pivot(
             index="issue_type",
@@ -168,13 +174,9 @@ if st.button("Ask") and question:
         ).fillna(0)
         st.bar_chart(pivot)
 
-    # ----- TOP -----
+    # TOP → CHART ONLY
     elif intent == "TOP":
         st.bar_chart(result.set_index("issue_type"))
-
-    # ----- SUMMARY / GENERAL -----
-    else:
-        st.success(generate_text(intent, question, result))
 
 # ================= SIDEBAR =================
 st.sidebar.header("📌 Example Questions")
@@ -182,7 +184,7 @@ st.sidebar.markdown("""
 - Count of unresolved issues
 - Why pending cases are increasing?
 - Why service issues affect customer satisfaction?
-- Why delivery issues are high?
+- What problems are customers facing?
 - Show sentiment distribution by issue
 - Which issue type has most complaints?
 - Give an overview of customer issues
