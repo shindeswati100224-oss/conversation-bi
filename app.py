@@ -32,7 +32,7 @@ con = get_connection(df)
 def has_any(q, words):
     return any(w in q for w in words)
 
-# ================= LLM-2 : SQL GENERATOR =================
+# ================= LLM-2 : SQL GENERATION =================
 def generate_sql(question):
     q = question.lower()
 
@@ -43,7 +43,7 @@ def generate_sql(question):
         WHERE sentiment = 'Negative'
         """
 
-    if has_any(q, ["unresolved", "pending"]):
+    if has_any(q, ["pending", "unresolved"]):
         return f"""
         SELECT issue_type, COUNT(*) AS count
         FROM {TABLE_NAME}
@@ -75,7 +75,6 @@ def generate_sql(question):
         GROUP BY issue_type, sentiment, resolution_status
         """
 
-    # fallback – always answer
     return f"SELECT * FROM {TABLE_NAME} LIMIT 50"
 
 # ================= OUTPUT DECISION =================
@@ -91,37 +90,46 @@ def decide_output(df):
 
     return "summary"
 
-# ================= LLM-3 : REASONING ENGINE =================
+# ================= LLM-3 : SAFE INSIGHT ENGINE =================
 def generate_insight(question, df):
     q = question.lower()
 
     if df.empty:
-        return "No data found for this question."
+        return "No data available for this question."
 
-    # KPI insight
+    # KPI
     if df.shape == (1, 1):
-        return f"The analysis shows **{int(df.iloc[0,0])}** matching records."
+        return f"The result shows **{int(df.iloc[0,0])}** matching records."
 
-    # WHY reasoning
-    if has_any(q, ["why", "reason", "cause"]) and "sentiment" in df.columns:
-        neg = df[df["sentiment"] == "Negative"]
-        if not neg.empty:
-            top_issue = neg.groupby("issue_type")["count"].sum().idxmax()
-            pending_pct = (
-                neg[neg["resolution_status"] == "Pending"]["count"].sum()
-                / neg["count"].sum()
-            ) * 100
+    # WHY reasoning (SAFE)
+    if has_any(q, ["why", "reason", "cause"]):
 
-            return (
-                f"Insights indicate **{top_issue}** as the primary driver. "
-                f"About **{pending_pct:.0f}%** of negative cases remain unresolved, "
-                f"which is contributing to customer dissatisfaction."
-            )
+        if "sentiment" in df.columns:
+            neg = df[df["sentiment"] == "Negative"]
 
-    # Distribution insight
-    if "sentiment" in df.columns:
+            if not neg.empty and "count" in neg.columns:
+                top_issue = (
+                    neg.groupby("issue_type")["count"].sum().idxmax()
+                    if "issue_type" in neg.columns else "multiple issues"
+                )
+
+                if "resolution_status" in neg.columns:
+                    pending_pct = (
+                        neg[neg["resolution_status"] == "Pending"]["count"].sum()
+                        / neg["count"].sum()
+                    ) * 100
+                    return (
+                        f"Negative sentiment is mainly driven by **{top_issue}**. "
+                        f"Approximately **{pending_pct:.0f}%** of these cases are still pending, "
+                        f"which increases customer dissatisfaction."
+                    )
+
+                return f"Negative sentiment is primarily associated with **{top_issue}** issues."
+
+    # Sentiment insight
+    if "sentiment" in df.columns and "count" in df.columns:
         dominant = df.groupby("sentiment")["count"].sum().idxmax()
-        return f"The data shows **{dominant}** sentiment as the most dominant."
+        return f"Overall, **{dominant}** sentiment dominates the dataset."
 
     return "Here is the analysis based on the available data."
 
@@ -134,18 +142,15 @@ if st.button("Ask") and question:
     result = con.execute(sql).fetchdf()
     output = decide_output(result)
 
-    # KPI
     if output == "kpi":
         st.metric("Result", int(result.iloc[0, 0]))
         st.info(generate_insight(question, result))
 
-    # TABLE + CHART + INSIGHT
     elif output == "table_chart":
         st.dataframe(result, use_container_width=True)
         st.bar_chart(result.set_index(result.columns[0]))
         st.success(generate_insight(question, result))
 
-    # STACKED CHART (SAFE)
     elif output == "stacked_chart":
         if "sentiment" in result.columns:
             pivot = result.pivot(
@@ -159,15 +164,14 @@ if st.button("Ask") and question:
 
         st.success(generate_insight(question, result))
 
-    # SUMMARY
     else:
         st.success(generate_insight(question, result))
 
 # ================= SIDEBAR =================
 st.sidebar.header("📌 Example Questions")
 st.sidebar.markdown("""
-- How many customers are frustrated?
 - Count of unresolved issues
+- How many customers are frustrated?
 - Which issue type has most pending cases?
 - Show sentiment distribution by issue
 - Why customers are dissatisfied?
