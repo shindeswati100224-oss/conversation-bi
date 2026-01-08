@@ -1,0 +1,10 @@
+# DuckDB files
+*.duckdb
+*.duckdb.wal
+
+# Python cache
+__pycache__/
+*.pyc
+
+# OS files
+.DS_Store
