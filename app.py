@@ -8,172 +8,182 @@ CSV_PATH = "conversation_bi_output_FAST.csv"
 DB_PATH = "conversation_bi.duckdb"
 TABLE_NAME = "conversations"
 
-# ================= PAGE SETUP =================
+# ================= PAGE =================
 st.set_page_config(page_title="Conversational BI", layout="wide")
 st.title("🧠 Conversational BI")
-st.caption("Ask anything. System decides KPI, table, chart, or insight.")
+st.caption("Ask anything. System detects intent and shows KPI, table, chart, or insight.")
 
 # ================= LOAD DATA =================
 @st.cache_data
-def load_dataframe():
+def load_df():
     return pd.read_csv(CSV_PATH)
 
 @st.cache_resource
-def get_connection(df):
-    con = duckdb.connect(database=DB_PATH, read_only=False)
+def get_con(df):
+    con = duckdb.connect(DB_PATH, read_only=False)
     con.execute(f"DROP TABLE IF EXISTS {TABLE_NAME}")
     con.execute(f"CREATE TABLE {TABLE_NAME} AS SELECT * FROM df")
     return con
 
-df = load_dataframe()
-con = get_connection(df)
+df = load_df()
+con = get_con(df)
 
-# ================= HELPERS =================
-def has_any(q, words):
-    return any(w in q for w in words)
+# ================= INTENT DETECTION =================
+def detect_intent(q):
+    q = q.lower()
 
-# ================= LLM-2 : SQL GENERATION =================
-def generate_sql(question):
+    if any(w in q for w in ["how many", "count", "number"]):
+        return "COUNT"
+
+    if any(w in q for w in ["distribution", "breakdown", "split"]):
+        return "DISTRIBUTION"
+
+    if any(w in q for w in ["most", "top", "highest"]):
+        return "TOP"
+
+    if any(w in q for w in ["why", "reason", "cause"]):
+        return "WHY"
+
+    if any(w in q for w in ["overview", "summary", "analyze"]):
+        return "SUMMARY"
+
+    return "GENERAL"
+
+# ================= SQL GENERATION =================
+def generate_sql(intent, question):
     q = question.lower()
 
-    if has_any(q, ["how many", "count", "number"]) and has_any(q, ["negative", "frustrated"]):
-        return f"""
-        SELECT COUNT(*) AS value
-        FROM {TABLE_NAME}
-        WHERE sentiment = 'Negative'
-        """
+    if intent == "COUNT":
+        if "pending" in q or "unresolved" in q:
+            return f"""
+            SELECT COUNT(*) AS value
+            FROM {TABLE_NAME}
+            WHERE resolution_status = 'Pending'
+            """
+        if "negative" in q or "frustrated" in q:
+            return f"""
+            SELECT COUNT(*) AS value
+            FROM {TABLE_NAME}
+            WHERE sentiment = 'Negative'
+            """
+        return f"SELECT COUNT(*) AS value FROM {TABLE_NAME}"
 
-    if has_any(q, ["pending", "unresolved"]):
-        return f"""
-        SELECT issue_type, COUNT(*) AS count
-        FROM {TABLE_NAME}
-        WHERE resolution_status = 'Pending'
-        GROUP BY issue_type
-        ORDER BY count DESC
-        """
-
-    if "sentiment" in q:
+    if intent == "DISTRIBUTION":
         return f"""
         SELECT issue_type, sentiment, COUNT(*) AS count
         FROM {TABLE_NAME}
         GROUP BY issue_type, sentiment
         """
 
-    if has_any(q, ["most", "highest", "top"]) and "issue" in q:
+    if intent == "TOP":
         return f"""
         SELECT issue_type, COUNT(*) AS count
         FROM {TABLE_NAME}
         GROUP BY issue_type
         ORDER BY count DESC
-        LIMIT 1
+        LIMIT 5
         """
 
-    if has_any(q, ["why", "reason", "cause"]):
+    if intent == "WHY":
+        if "pending" in q:
+            return f"""
+            SELECT issue_type, COUNT(*) AS count
+            FROM {TABLE_NAME}
+            WHERE resolution_status = 'Pending'
+            GROUP BY issue_type
+            ORDER BY count DESC
+            """
+        if "sentiment" in q or "dissatisfied" in q:
+            return f"""
+            SELECT issue_type, sentiment, COUNT(*) AS count
+            FROM {TABLE_NAME}
+            GROUP BY issue_type, sentiment
+            """
         return f"""
-        SELECT issue_type, sentiment, resolution_status, COUNT(*) AS count
+        SELECT issue_type, COUNT(*) AS count
         FROM {TABLE_NAME}
-        GROUP BY issue_type, sentiment, resolution_status
+        GROUP BY issue_type
+        ORDER BY count DESC
         """
 
-    return f"SELECT * FROM {TABLE_NAME} LIMIT 50"
+    return f"SELECT issue_type, COUNT(*) AS count FROM {TABLE_NAME} GROUP BY issue_type"
 
-# ================= OUTPUT DECISION =================
+# ================= OUTPUT TYPE =================
 def decide_output(df):
     if df.shape == (1, 1):
-        return "kpi"
-
-    if "sentiment" in df.columns and "issue_type" in df.columns:
-        return "stacked_chart"
-
+        return "KPI"
+    if "sentiment" in df.columns:
+        return "STACKED"
     if df.shape[0] > 1:
-        return "table_chart"
+        return "TABLE_CHART"
+    return "SUMMARY"
 
-    return "summary"
-
-# ================= LLM-3 : SAFE INSIGHT ENGINE =================
-def generate_insight(question, df):
-    q = question.lower()
-
+# ================= INSIGHT ENGINE =================
+def generate_insight(intent, question, df):
     if df.empty:
         return "No data available for this question."
 
-    # KPI
-    if df.shape == (1, 1):
-        return f"The result shows **{int(df.iloc[0,0])}** matching records."
+    # COUNT
+    if intent == "COUNT":
+        return f"The total count is **{int(df.iloc[0,0])}**."
 
-    # WHY reasoning (SAFE)
-    if has_any(q, ["why", "reason", "cause"]):
+    # WHY
+    if intent == "WHY":
+        top = df.iloc[0]
+        total = df["count"].sum()
+        pct = (top["count"] / total) * 100
+        return (
+            f"The primary reason is **{top['issue_type']}** issues, "
+            f"which contribute **{pct:.0f}%** of the total cases."
+        )
 
-        if "sentiment" in df.columns:
-            neg = df[df["sentiment"] == "Negative"]
-
-            if not neg.empty and "count" in neg.columns:
-                top_issue = (
-                    neg.groupby("issue_type")["count"].sum().idxmax()
-                    if "issue_type" in neg.columns else "multiple issues"
-                )
-
-                if "resolution_status" in neg.columns:
-                    pending_pct = (
-                        neg[neg["resolution_status"] == "Pending"]["count"].sum()
-                        / neg["count"].sum()
-                    ) * 100
-                    return (
-                        f"Negative sentiment is mainly driven by **{top_issue}**. "
-                        f"Approximately **{pending_pct:.0f}%** of these cases are still pending, "
-                        f"which increases customer dissatisfaction."
-                    )
-
-                return f"Negative sentiment is primarily associated with **{top_issue}** issues."
-
-    # Sentiment insight
-    if "sentiment" in df.columns and "count" in df.columns:
+    # DISTRIBUTION
+    if intent == "DISTRIBUTION":
         dominant = df.groupby("sentiment")["count"].sum().idxmax()
-        return f"Overall, **{dominant}** sentiment dominates the dataset."
+        return f"The distribution shows **{dominant}** sentiment dominating overall."
 
-    return "Here is the analysis based on the available data."
+    # TOP
+    if intent == "TOP":
+        return f"The most common issue type is **{df.iloc[0]['issue_type']}**."
+
+    # SUMMARY / GENERAL
+    top = df.sort_values("count", ascending=False).iloc[0]
+    return f"Overall, **{top['issue_type']}** issues appear most frequently."
 
 # ================= UI =================
 st.subheader("💬 Ask a question")
 question = st.text_input("Ask anything about customers, issues, sentiment, service…")
 
 if st.button("Ask") and question:
-    sql = generate_sql(question)
+    intent = detect_intent(question)
+    sql = generate_sql(intent, question)
     result = con.execute(sql).fetchdf()
     output = decide_output(result)
 
-    if output == "kpi":
-        st.metric("Result", int(result.iloc[0, 0]))
-        st.info(generate_insight(question, result))
+    if output == "KPI":
+        st.metric("Result", int(result.iloc[0,0]))
+        st.info(generate_insight(intent, question, result))
 
-    elif output == "table_chart":
+    elif output == "STACKED":
+        pivot = result.pivot(index="issue_type", columns="sentiment", values="count").fillna(0)
+        st.bar_chart(pivot)
+        st.success(generate_insight(intent, question, result))
+
+    elif output == "TABLE_CHART":
         st.dataframe(result, use_container_width=True)
         st.bar_chart(result.set_index(result.columns[0]))
-        st.success(generate_insight(question, result))
-
-    elif output == "stacked_chart":
-        if "sentiment" in result.columns:
-            pivot = result.pivot(
-                index="issue_type",
-                columns="sentiment",
-                values="count"
-            ).fillna(0)
-            st.bar_chart(pivot)
-        else:
-            st.bar_chart(result.set_index(result.columns[0]))
-
-        st.success(generate_insight(question, result))
+        st.success(generate_insight(intent, question, result))
 
     else:
-        st.success(generate_insight(question, result))
+        st.success(generate_insight(intent, question, result))
 
 # ================= SIDEBAR =================
 st.sidebar.header("📌 Example Questions")
 st.sidebar.markdown("""
 - Count of unresolved issues
 - How many customers are frustrated?
-- Which issue type has most pending cases?
+- Why pending cases are increasing?
 - Show sentiment distribution by issue
-- Why customers are dissatisfied?
-- Why delivery issues are high?
+- Which issue type has most complaints?
+- Give an overview of customer issues
 """)
