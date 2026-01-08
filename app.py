@@ -11,7 +11,7 @@ TABLE_NAME = "conversations"
 # ================= PAGE SETUP =================
 st.set_page_config(page_title="Conversational BI", layout="wide")
 st.title("🧠 Conversational BI")
-st.caption("Ask anything. System decides table, chart, or summary.")
+st.caption("Ask anything. System decides KPI, table, chart, or insight.")
 
 # ================= LOAD DATA =================
 @st.cache_data
@@ -29,123 +29,138 @@ df = load_dataframe()
 con = get_connection(df)
 
 # ================= INTENT HELPERS =================
-def is_why(q):
-    return any(w in q for w in ["why", "reason", "explain", "cause", "not satisfied"])
+def has_any(q, words):
+    return any(w in q for w in words)
 
-def wants_count(q):
-    return any(w in q for w in ["how many", "count", "number"])
-
-def wants_distribution(q):
-    return any(w in q for w in ["distribution", "breakdown", "by"])
-
-# ================= LLM-2 : SQL GENERATION =================
-def llm2_generate_sql(question: str):
+# ================= LLM-2 : SQL GENERATOR =================
+def generate_sql(question):
     q = question.lower()
 
-    if "frustrated" in q or "negative" in q:
+    if has_any(q, ["how many", "count", "number"]) and has_any(q, ["negative", "frustrated"]):
         return f"""
-        SELECT COUNT(*) AS count
+        SELECT COUNT(*) AS value
         FROM {TABLE_NAME}
-        WHERE sentiment = 'Negative';
+        WHERE sentiment = 'Negative'
         """
 
-    if "pending" in q:
+    if has_any(q, ["pending"]):
         return f"""
         SELECT issue_type, COUNT(*) AS count
         FROM {TABLE_NAME}
         WHERE resolution_status = 'Pending'
         GROUP BY issue_type
-        ORDER BY count DESC;
+        ORDER BY count DESC
         """
 
-    if "sentiment" in q:
+    if has_any(q, ["sentiment"]):
         return f"""
         SELECT issue_type, sentiment, COUNT(*) AS count
         FROM {TABLE_NAME}
-        GROUP BY issue_type, sentiment;
+        GROUP BY issue_type, sentiment
         """
 
-    if "most" in q and "issue" in q:
+    if has_any(q, ["most", "highest", "top"]) and "issue" in q:
         return f"""
         SELECT issue_type, COUNT(*) AS count
         FROM {TABLE_NAME}
         GROUP BY issue_type
         ORDER BY count DESC
-        LIMIT 1;
+        LIMIT 1
         """
 
-    return None
+    if has_any(q, ["why", "reason", "cause"]):
+        return f"""
+        SELECT issue_type, sentiment, resolution_status, COUNT(*) AS count
+        FROM {TABLE_NAME}
+        GROUP BY issue_type, sentiment, resolution_status
+        """
 
-# ================= LLM-3 : OUTPUT DECISION =================
-def decide_output(question, result_df):
-    q = question.lower()
+    # fallback – always answer
+    return f"SELECT * FROM {TABLE_NAME} LIMIT 50"
 
-    if is_why(q):
-        return "summary"
-
-    if wants_count(q) and result_df.shape == (1, 1):
+# ================= OUTPUT DECISION =================
+def decide_output(df):
+    if df.shape == (1, 1):
         return "kpi"
 
-    if "sentiment" in q and "issue_type" in result_df.columns:
+    if "sentiment" in df.columns and "issue_type" in df.columns:
         return "stacked_chart"
 
-    if len(result_df) > 1:
+    if df.shape[0] > 1 and df.shape[1] > 1:
         return "table_chart"
 
     return "summary"
 
-# ================= LLM-3 : SUMMARY ENGINE =================
-def llm3_summary(question, df):
+# ================= LLM-3 : REASONING ENGINE =================
+def generate_insight(question, df):
     q = question.lower()
 
-    if "service" in q or "not satisfied" in q:
-        top_issue = df[df["sentiment"]=="Negative"]["issue_type"].value_counts().idxmax()
-        return f"Customers are mainly dissatisfied due to **{top_issue}** issues, driven by negative sentiment and unresolved cases."
+    if df.empty:
+        return "No data found for this question."
 
-    if "delivery" in q:
-        return "Delivery issues are largely caused by delays and failed deliveries, reflected by high negative sentiment."
+    # KPI insight
+    if df.shape == (1, 1):
+        return f"The result shows **{int(df.iloc[0,0])}** matching records."
 
-    return "Based on overall trends, negative sentiment and pending resolutions are the main drivers of customer dissatisfaction."
+    # Why-type reasoning
+    if has_any(q, ["why", "reason", "cause"]):
+        neg = df[df["sentiment"] == "Negative"]
+        if not neg.empty:
+            top_issue = neg.groupby("issue_type")["count"].sum().idxmax()
+            pending_pct = (
+                neg[neg["resolution_status"] == "Pending"]["count"].sum()
+                / neg["count"].sum()
+            ) * 100
+            return (
+                f"Analysis shows **{top_issue}** as the primary driver. "
+                f"Approximately **{pending_pct:.0f}%** of negative cases remain unresolved, "
+                f"which is increasing customer dissatisfaction."
+            )
+
+    # Distribution insight
+    if "sentiment" in df.columns:
+        dominant = df.groupby("sentiment")["count"].sum().idxmax()
+        return f"Overall sentiment is dominated by **{dominant}** cases."
+
+    return "Here is the analysis based on the available data."
 
 # ================= UI =================
 st.subheader("💬 Ask a question")
 question = st.text_input("Ask anything about customers, issues, sentiment, service…")
 
 if st.button("Ask") and question:
-    sql = llm2_generate_sql(question)
+    sql = generate_sql(question)
+    result = con.execute(sql).fetchdf()
 
-    if sql:
-        result = con.execute(sql).fetchdf()
-        output = decide_output(question, result)
+    output = decide_output(result)
 
-        # KPI
-        if output == "kpi":
-            st.metric("Result", int(result.iloc[0, 0]))
+    # KPI
+    if output == "kpi":
+        st.metric("Result", int(result.iloc[0, 0]))
+        st.info(generate_insight(question, result))
 
-        # TABLE + CHART
-        elif output == "table_chart":
-            st.dataframe(result, use_container_width=True)
-            st.bar_chart(result.set_index(result.columns[0]))
+    # TABLE + CHART + INSIGHT
+    elif output == "table_chart":
+        st.dataframe(result, use_container_width=True)
+        st.bar_chart(result.set_index(result.columns[0]))
+        st.success(generate_insight(question, result))
 
-        # STACKED CHART
-        elif output == "stacked_chart":
-            pivot = result.pivot(index="issue_type", columns="sentiment", values="count").fillna(0)
-            st.bar_chart(pivot)
+    # STACKED CHART + INSIGHT
+    elif output == "stacked_chart":
+        pivot = result.pivot(index="issue_type", columns="sentiment", values="count").fillna(0)
+        st.bar_chart(pivot)
+        st.success(generate_insight(question, result))
 
-        # SUMMARY
-        else:
-            st.success(llm3_summary(question, df))
-
+    # SUMMARY ONLY
     else:
-        # ALWAYS ANSWER
-        st.success(llm3_summary(question, df))
+        st.success(generate_insight(question, result))
 
 # ================= SIDEBAR =================
 st.sidebar.header("📌 Example Questions")
 st.sidebar.markdown("""
-- How many persons are frustrated?
+- How many customers are frustrated?
 - Which issue type has most pending cases?
 - Show sentiment distribution by issue
-- Why customers are not satisfied with service?
+- Why customers are dissatisfied?
 - Why delivery issues are high?
 """)
